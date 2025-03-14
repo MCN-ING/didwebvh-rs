@@ -1,0 +1,2376 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+================================================================
+File Summary
+================================================================
+
+Purpose:
+--------
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+
+File Format:
+------------
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Multiple file entries, each consisting of:
+  a. A separator line (================)
+  b. The file path (File: path/to/file)
+  c. Another separator line
+  d. The full contents of the file
+  e. A blank line
+
+Usage Guidelines:
+-----------------
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+
+Notes:
+------
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+
+Additional Info:
+----------------
+
+================================================================
+Directory Structure
+================================================================
+src/
+  crypto/
+    mod.rs
+  http/
+    mod.rs
+  log/
+    mod.rs
+  resolver/
+    mod.rs
+  types/
+    mod.rs
+  url/
+    mod.rs
+  utils/
+    mod.rs
+  error.rs
+  lib.rs
+.gitignore
+Cargo.toml
+
+================================================================
+Files
+================================================================
+
+================
+File: src/crypto/mod.rs
+================
+//! Module for cryptographic operations.
+//!
+//! This module provides functions for:
+//! - SCID generation and verification
+//! - Entry hash generation and verification
+//! - Handling JSON Canonicalization Scheme (JCS)
+//! - Multihash and base58btc encoding
+
+use crate::error::{ResolverError, Result};
+use crate::types::{DIDLogEntry, Parameters};
+use base58::{self, ToBase58};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use multihash::{Multihash};
+use serde_json_canonicalizer::to_string as to_canonical_json;
+
+/// SHA-256 multihash code
+pub const SHA2_256: u64 = 0x12;
+
+/// Generate a multihash using SHA-256
+fn generate_multihash(data: &[u8]) -> Result<Vec<u8>> {
+    // Create a new SHA-256 hasher
+    let mut hasher = Sha256::new();
+    
+    // Update the hasher with the input data
+    hasher.update(data);
+    
+    // Finalize and get the hash
+    let hash = hasher.finalize();
+    
+    // Wrap the hash in a multihash format
+    let multihash = Multihash::<64>::wrap(SHA2_256, &hash)
+        .map_err(|_| ResolverError::Verification("Failed to create multihash".to_string()))?;
+    
+    Ok(multihash.to_bytes())
+}
+
+/// Convert bytes to base58btc encoding
+fn to_base58btc(hash: &[u8]) -> String {
+    hash.to_base58()
+}
+
+/// Generate a hash string using multihash and base58btc encoding
+pub fn hash_to_base58btc(data: &[u8]) -> Result<String> {
+    let multihash_bytes = generate_multihash(data)?;
+    Ok(to_base58btc(&multihash_bytes))
+}
+
+/// Verify the SCID of a DID based on the first log entry
+///
+/// The SCID is generated as:
+/// base58btc(multihash(JCS(preliminary log entry with {SCID} placeholders), <hash algorithm>))
+pub fn verify_scid(entry: &DIDLogEntry) -> Result<()> {
+    // Extract the SCID from the entry parameters
+    let scid = entry.parameters.scid.as_ref().ok_or_else(|| {
+        ResolverError::Verification("Missing SCID parameter in first entry".to_string())
+    })?;
+
+    // 1. Create a copy of the entry to manipulate
+    let mut entry_copy = entry.clone();
+    
+    // 2. Remove the proof (not part of the SCID calculation)
+    entry_copy.proof.clear();
+    
+    // 3. Replace the versionId with "{SCID}" placeholder
+    entry_copy.version_id = "{SCID}".to_string();
+    
+    // 4. Replace all instances of the actual SCID with the placeholder in the entire entry
+    let entry_json = serde_json::to_string(&entry_copy).map_err(|e| {
+        ResolverError::Verification(format!("Failed to serialize entry for SCID verification: {}", e))
+    })?;
+    
+    let entry_with_placeholders = entry_json.replace(scid, "{SCID}");
+    
+    // 5. Parse the modified entry back to a JSON value
+    let entry_value: Value = serde_json::from_str(&entry_with_placeholders).map_err(|e| {
+        ResolverError::Verification(format!("Failed to parse entry with placeholders: {}", e))
+    })?;
+    
+    // 6. Apply JCS to get a canonical representation
+    let canonical = to_canonical_json(&entry_value).map_err(|e| {
+        ResolverError::Verification(format!("Failed to canonicalize JSON: {}", e))
+    })?;
+    
+    // 7. Calculate the hash using SHA-256 (as specified for did:webvh 0.5)
+    let calculated_scid = hash_to_base58btc(canonical.as_bytes())?;
+    
+    // 8. Compare with the provided SCID
+    if calculated_scid != *scid {
+        return Err(ResolverError::Verification(format!(
+            "SCID verification failed: calculated {} but found {}",
+            calculated_scid, scid
+        )));
+    }
+    
+    Ok(())
+}
+
+/// Verify the entry hash within a versionId
+///
+/// The entry hash is generated as:
+/// base58btc(multihash(JCS(entry with versionId set to predecessor's versionId), <hash algorithm>))
+pub fn verify_entry_hash(
+    entry: &DIDLogEntry,
+    prev_version_id: Option<&str>
+) -> Result<()> {
+    // Extract the version number and entry hash from the versionId
+    let version_parts: Vec<&str> = entry.version_id.split('-').collect();
+    if version_parts.len() != 2 {
+        return Err(ResolverError::Verification(format!(
+            "Invalid versionId format: {}", entry.version_id
+        )));
+    }
+    
+    let entry_hash = version_parts[1];
+    
+    // Create a copy of the entry to manipulate
+    let mut entry_copy = entry.clone();
+    
+    // Remove the proof (not part of the hash calculation)
+    entry_copy.proof.clear();
+    
+    // Set the versionId to the predecessor's versionId
+    // For the first entry, this is the SCID
+    // For subsequent entries, this is the previous entry's versionId
+    entry_copy.version_id = match prev_version_id {
+        Some(id) => id.to_string(),
+        None => {
+            // If no previous versionId is provided (for the first entry),
+            // use the SCID from parameters
+            entry_copy.parameters.scid.as_ref().ok_or_else(|| {
+                ResolverError::Verification("Missing SCID for first entry hash verification".to_string())
+            })?.clone()
+        }
+    };
+    
+    // Apply JCS to get a canonical representation
+    let entry_json = serde_json::to_value(entry_copy).map_err(|e| {
+        ResolverError::Verification(format!("Failed to convert entry to JSON: {}", e))
+    })?;
+    
+    let canonical = to_canonical_json(&entry_json).map_err(|e| {
+        ResolverError::Verification(format!("Failed to canonicalize JSON: {}", e))
+    })?;
+    
+    // Calculate the hash using SHA-256 (as specified for did:webvh 0.5)
+    let calculated_hash = hash_to_base58btc(canonical.as_bytes())?;
+    
+    // Compare with the provided hash
+    if calculated_hash != entry_hash {
+        return Err(ResolverError::Verification(format!(
+            "Entry hash verification failed: calculated {} but found {}",
+            calculated_hash, entry_hash
+        )));
+    }
+    
+    Ok(())
+}
+
+/// Verify the SCID and all entry hashes in a DID log
+pub fn verify_did_log_integrity(entries: &[DIDLogEntry]) -> Result<()> {
+    if entries.is_empty() {
+        return Err(ResolverError::Verification("Empty DID log".to_string()));
+    }
+    
+    // Verify the SCID of the first entry
+    verify_scid(&entries[0])?;
+    
+    // Verify the entry hash of each entry
+    for (i, entry) in entries.iter().enumerate() {
+        let prev_version_id = if i == 0 {
+            None // First entry uses SCID
+        } else {
+            Some(entries[i-1].version_id.as_str())
+        };
+        
+        verify_entry_hash(entry, prev_version_id)?;
+    }
+    
+    Ok(())
+}
+
+/// Hash a multikey representation for pre-rotation verification
+pub fn hash_multikey(multikey: &str) -> Result<String> {
+    // For pre-rotation, we hash the multikey directly
+    let hash = hash_to_base58btc(multikey.as_bytes())?;
+    Ok(hash)
+}
+
+/// Verify pre-rotation key hashes
+///
+/// Checks that each key in update_keys has its hash in the previous next_key_hashes array
+pub fn verify_prerotation(
+    update_keys: &[String],
+    prev_next_key_hashes: &[String]
+) -> Result<()> {
+    // For each update key, check if its hash is in the previous next_key_hashes
+    for key in update_keys {
+        let key_hash = hash_multikey(key)?;
+        
+        if !prev_next_key_hashes.contains(&key_hash) {
+            return Err(ResolverError::Verification(format!(
+                "Pre-rotation verification failed: hash of key {} not found in previous nextKeyHashes",
+                key
+            )));
+        }
+    }
+    
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::Proof;
+    
+    #[test]
+    fn test_hash_to_base58btc() {
+        let data = b"test data";
+        let hash = hash_to_base58btc(data).unwrap();
+        
+        // The hash should be a non-empty string
+        assert!(!hash.is_empty());
+        
+        // The same data should always produce the same hash
+        let hash2 = hash_to_base58btc(data).unwrap();
+        assert_eq!(hash, hash2);
+        
+        // Different data should produce different hashes
+        let data2 = b"different data";
+        let hash3 = hash_to_base58btc(data2).unwrap();
+        assert_ne!(hash, hash3);
+    }
+    
+    #[test]
+    fn test_verify_entry_hash_with_simple_data() {
+        // Create a simple entry with a known hash
+        let mut entry = DIDLogEntry {
+            version_id: "1-QmQq6Kg4ZZ1p49znzxnWmes4LkkWgMWLrnrfPre8UD56bz".to_string(),
+            version_time: "2024-09-26T23:22:26Z".to_string(),
+            parameters: Parameters {
+                method: Some("did:webvh:0.5".to_string()),
+                scid: Some("QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ".to_string()),
+                update_keys: Some(vec!["z6MkhbNRN2Q9BaY9TvTc2K3izkhfVwgHiXL7VWZnTqxEvc3R".to_string()]),
+                ..Parameters::default()
+            },
+            state: json!({
+                "@context": ["https://www.w3.org/ns/did/v1"],
+                "id": "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:domain.example"
+            }),
+            proof: vec![Proof {
+                type_: "DataIntegrityProof".to_string(),
+                cryptosuite: "eddsa-jcs-2022".to_string(),
+                verification_method: "did:key:z6MkhbNRN2Q9BaY9TvTc2K3izkhfVwgHiXL7VWZnTqxEvc3R#z6MkhbNRN2Q9BaY9TvTc2K3izkhfVwgHiXL7VWZnTqxEvc3R".to_string(),
+                created: "2024-09-26T23:22:26Z".to_string(),
+                proof_purpose: "assertionMethod".to_string(),
+                proof_value: "z2fPF6fMewtV15kji2N432R7RjmmFs8p7MiSHSTM9FoVmJPtc3JUuZ472pZKoWgZDuT75EDwkGmZbK8ZKVF55pXvx".to_string(),
+            }],
+        };
+        
+        // Calculate the hash for this entry manually to test
+        let mut entry_copy = entry.clone();
+        entry_copy.proof.clear();
+        entry_copy.version_id = "QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ".to_string();
+        
+        let entry_json = serde_json::to_value(entry_copy).unwrap();
+        let canonical = to_canonical_json(&entry_json).unwrap();
+        let calculated_hash = hash_to_base58btc(canonical.as_bytes()).unwrap();
+        
+        // Update the entry to use our calculated hash
+        entry.version_id = format!("1-{}", calculated_hash);
+        
+        // Now verify it - this should pass
+        let result = verify_entry_hash(&entry, None);
+        assert!(result.is_ok(), "Entry hash verification failed: {:?}", result);
+    }
+    
+    // Additional tests would be added for:
+    // - SCID verification
+    // - Multi-entry log integrity verification
+    // - Pre-rotation verification
+    // - Edge cases and error handling
+}
+
+================
+File: src/http/mod.rs
+================
+//! Module for HTTP client functionality.
+//! 
+//! This module provides a trait for HTTP client operations and a default implementation
+//! using reqwest.
+
+use crate::error::{ResolverError, Result};
+use async_trait::async_trait;
+use reqwest::{Client, StatusCode};
+use std::time::Duration;
+
+/// Trait defining the HTTP client interface for fetching resources.
+#[async_trait]
+pub trait HttpClient: Send + Sync {
+    /// Fetch a resource from the given URL.
+    ///
+    /// # Arguments
+    /// * `url` - The URL to fetch.
+    /// * `accept` - Optional accept header value.
+    ///
+    /// # Returns
+    /// * `Ok(Vec<u8>)` - The fetched resource as bytes.
+    /// * `Err(ResolverError)` - Any error that occurred during the fetch.
+    async fn get(&self, url: &str, accept: Option<String>) -> Result<Vec<u8>>;
+}
+
+/// Default HTTP client implementation using reqwest.
+pub struct DefaultHttpClient {
+    client: Client,
+    timeout: Duration,
+}
+
+impl DefaultHttpClient {
+    /// Create a new DefaultHttpClient with the default configuration.
+    pub fn new() -> Self {
+        Self::with_timeout(Duration::from_secs(30))
+    }
+
+    /// Create a new DefaultHttpClient with a custom timeout.
+    pub fn with_timeout(timeout: Duration) -> Self {
+        // Configure client with appropriate defaults for DID resolution
+        let client = Client::builder()
+            .timeout(timeout)
+            .user_agent("didwebvh-resolver/0.1.0")
+            .build()
+            .expect("Failed to create HTTP client");
+
+        Self { client, timeout }
+    }
+}
+
+#[async_trait]
+impl HttpClient for DefaultHttpClient {
+    async fn get(&self, url: &str, accept: Option<String>) -> Result<Vec<u8>> {
+        let mut request = self.client.get(url);
+        
+        // Add accept header if provided
+        if let Some(accept_value) = accept {
+            request = request.header(reqwest::header::ACCEPT, accept_value);
+        }
+        
+        // Execute request
+        let response = request.send().await.map_err(|e| {
+            if e.is_timeout() {
+                ResolverError::Http(format!("Request to {} timed out after {:?}", url, self.timeout))
+            } else if e.is_connect() {
+                ResolverError::Http(format!("Connection failed for {}: {}", url, e))
+            } else {
+                ResolverError::Http(format!("HTTP request failed for {}: {}", url, e))
+            }
+        })?;
+        
+        // Check status code
+        let status = response.status();
+        if !status.is_success() {
+            return match status {
+                StatusCode::NOT_FOUND => {
+                    Err(ResolverError::Http(format!("Resource not found at {}", url)))
+                }
+                _ => {
+                    Err(ResolverError::Http(format!(
+                        "HTTP error {} when fetching {}: {}",
+                        status.as_u16(),
+                        url,
+                        status.canonical_reason().unwrap_or("Unknown error")
+                    )))
+                }
+            };
+        }
+        
+        // Get response body
+        let bytes = response.bytes().await.map_err(|e| {
+            ResolverError::Http(format!("Failed to read response body from {}: {}", url, e))
+        })?;
+        
+        Ok(bytes.to_vec())
+    }
+}
+
+#[cfg(test)]
+pub mod tests {
+    use super::*;
+    use mockall::predicate::*;
+    use mockall::*;
+
+    // Create a mock HTTP client for testing
+    mock! {
+        pub HttpClientMock {}
+        #[async_trait]
+        impl HttpClient for HttpClientMock {
+            async fn get(&self, url: &str, accept: Option<String>) -> Result<Vec<u8>>;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_default_http_client_success() {
+        // This test requires an internet connection and will hit a real API
+        // Consider skipping in CI environments
+        let client = DefaultHttpClient::new();
+        let result = client.get("https://httpbin.org/get", None).await;
+        
+        assert!(result.is_ok(), "Expected HTTP request to succeed");
+        let data = result.unwrap();
+        assert!(!data.is_empty(), "Expected non-empty response");
+    }
+
+    #[tokio::test]
+    async fn test_default_http_client_not_found() {
+        let client = DefaultHttpClient::new();
+        let result = client.get("https://httpbin.org/status/404", None).await;
+        
+        assert!(result.is_err(), "Expected HTTP 404 error");
+        match result {
+            Err(ResolverError::Http(msg)) => {
+                assert!(msg.contains("not found"), "Expected 'not found' error message");
+            }
+            _ => panic!("Expected HTTP error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_default_http_client_server_error() {
+        let client = DefaultHttpClient::new();
+        let result = client.get("https://httpbin.org/status/500", None).await;
+        
+        assert!(result.is_err(), "Expected HTTP 500 error");
+        match result {
+            Err(ResolverError::Http(msg)) => {
+                assert!(msg.contains("500"), "Expected error message to contain status code");
+            }
+            _ => panic!("Expected HTTP error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_default_http_client_with_accept_header() {
+        let client = DefaultHttpClient::new();
+        let result = client.get(
+            "https://httpbin.org/headers", 
+            Some("application/json".to_string())
+        ).await;
+        
+        assert!(result.is_ok(), "Expected HTTP request to succeed");
+        
+        // Fix the borrowing issue by storing the unwrapped result first
+        let bytes = result.unwrap();
+        let data = String::from_utf8_lossy(&bytes);
+        
+        assert!(data.contains("application/json"), 
+                "Expected response to contain the accept header we sent");
+    }
+
+    #[tokio::test]
+    async fn test_default_http_client_with_redirect() {
+        let client = DefaultHttpClient::new();
+        let result = client.get("https://httpbin.org/redirect/1", None).await;
+        
+        assert!(result.is_ok(), "Expected HTTP request with redirect to succeed");
+        let data = result.unwrap();
+        assert!(!data.is_empty(), "Expected non-empty response after redirect");
+    }
+
+    #[tokio::test]
+    async fn test_client_with_mock_for_did_log() {
+        let mut mock_client = MockHttpClientMock::new();
+        
+        // Set up the mock to expect a specific DID log URL
+        let expected_url = "https://example.com/.well-known/did.jsonl";
+        let mock_response = b"{\"versionId\": \"1-abc123\", \"versionTime\": \"2024-01-01T00:00:00Z\"}".to_vec();
+        
+        mock_client
+            .expect_get()
+            .with(eq(expected_url), eq(None))
+            .times(1)
+            .returning(move |_, _| Ok(mock_response.clone()));
+        
+        // Use the mock client
+        let result = mock_client.get(expected_url, None).await;
+        
+        assert!(result.is_ok(), "Expected mock HTTP request to succeed");
+        let data = result.unwrap();
+        assert!(!data.is_empty(), "Expected non-empty response from mock");
+        
+        // Convert to string and verify content
+        let content = String::from_utf8_lossy(&data);
+        assert!(content.contains("1-abc123"), "Expected DID log content in response");
+    }
+}
+
+================
+File: src/log/mod.rs
+================
+//! Module for processing DID log files.
+//! 
+//! This module provides functions for parsing and validating DID log entries
+//! according to the did:webvh specification.
+
+use crate::error::{ResolverError, Result};
+use crate::http::HttpClient;
+use crate::types::{DIDLogEntry, Parameters, DIDDocumentMetadata};
+use crate::url::DIDUrl;
+use crate::crypto::{verify_scid, verify_entry_hash, verify_prerotation};
+use serde_json::Value;
+use std::collections::HashMap;
+
+
+
+/// Parsed and validated DID log
+#[derive(Debug, Clone)]
+pub struct DIDLog {
+    /// All entries in the log
+    pub entries: Vec<DIDLogEntry>,
+    /// Latest active parameters
+    pub active_parameters: Parameters,
+    /// Mapping of version IDs to entry indices
+    pub version_id_map: HashMap<String, usize>,
+    /// Original DID string
+    pub did: String,
+}
+
+impl DIDLog {
+    /// Create a new, empty DID log
+    pub fn new(did: &str) -> Self {
+        Self {
+            entries: Vec::new(),
+            active_parameters: Parameters::default(),
+            version_id_map: HashMap::new(),
+            did: did.to_string(),
+        }
+    }
+
+    /// Get the latest entry in the log
+    pub fn latest_entry(&self) -> Option<&DIDLogEntry> {
+        self.entries.last()
+    }
+
+    /// Get an entry by version ID
+    pub fn get_entry_by_version_id(&self, version_id: &str) -> Option<&DIDLogEntry> {
+        self.version_id_map.get(version_id).map(|&idx| &self.entries[idx])
+    }
+
+    /// Get an entry by version number
+    pub fn get_entry_by_version_number(&self, version_number: u64) -> Option<&DIDLogEntry> {
+        let version_prefix = format!("{}-", version_number);
+        self.entries.iter().find(|entry| entry.version_id.starts_with(&version_prefix))
+    }
+
+    /// Get an entry by version time (closest entry at or before the given time)
+    pub fn get_entry_by_version_time(&self, version_time: &str) -> Option<&DIDLogEntry> {
+        // Basic implementation - we'll improve this later with proper timestamp parsing
+        self.entries.iter()
+            .filter(|entry| entry.version_time.as_str() <= version_time)
+            .max_by(|a, b| a.version_time.cmp(&b.version_time))
+    }
+
+    /// Generate DID document metadata from the log
+    pub fn generate_metadata(&self, entry: &DIDLogEntry) -> DIDDocumentMetadata {
+        let mut metadata = DIDDocumentMetadata::default();
+        
+        // Set created time from the first entry
+        if let Some(first_entry) = self.entries.first() {
+            metadata.created = Some(first_entry.version_time.clone());
+        }
+        
+        // Set updated time from the specified entry
+        metadata.updated = Some(entry.version_time.clone());
+        
+        // Set version ID
+        metadata.version_id = Some(entry.version_id.clone());
+        
+        // Set deactivated flag
+        metadata.deactivated = entry.parameters.deactivated;
+        
+        // Set next version ID if this isn't the latest entry
+        if let Some(idx) = self.version_id_map.get(&entry.version_id) {
+            if *idx < self.entries.len() - 1 {
+                metadata.next_version_id = Some(self.entries[*idx + 1].version_id.clone());
+            }
+        }
+        
+        // Check for equivalent IDs (e.g., from portable DIDs)
+        let equivalent_ids: Vec<String> = self.entries.iter()
+            .filter_map(|e| {
+                if let Value::Object(obj) = &e.state {
+                    if let Some(Value::Array(aka)) = obj.get("alsoKnownAs") {
+                        return Some(
+                            aka.iter()
+                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                .collect::<Vec<String>>()
+                        );
+                    }
+                }
+                None
+            })
+            .flatten()
+            .collect();
+        
+        if !equivalent_ids.is_empty() {
+            metadata.equivalent_id = Some(equivalent_ids);
+        }
+        
+        metadata
+    }
+}
+
+/// Parse a DID log file from raw bytes
+/// 
+/// This function takes raw bytes of a JSONL file and parses it into a list of DID log entries.
+/// It performs basic validation of the structure of each entry but does not perform
+/// cryptographic verification.
+pub fn parse_did_log(log_bytes: &[u8], did: &str) -> Result<DIDLog> {
+    let log_str = String::from_utf8_lossy(log_bytes);
+    let mut did_log = DIDLog::new(did);
+    
+    for (line_idx, line) in log_str.lines().enumerate() {
+        // Skip empty lines
+        if line.trim().is_empty() {
+            continue;
+        }
+        
+        // Parse the line as JSON
+        let entry: DIDLogEntry = serde_json::from_str(line)
+            .map_err(|e| ResolverError::LogProcessing(
+                format!("Failed to parse log entry at line {}: {}", line_idx + 1, e)
+            ))?;
+        
+        // Perform basic structure validation of the entry
+        validate_entry_structure(&entry, did_log.entries.len())
+            .map_err(|e| ResolverError::LogProcessing(
+                format!("Invalid log entry at line {}: {}", line_idx + 1, e)
+            ))?;
+        
+        // Determine if this is the first entry
+        let is_first_entry = did_log.entries.is_empty();
+        
+        // If this is the first entry, verify the SCID
+        if is_first_entry {
+            verify_scid(&entry)
+                .map_err(|e| ResolverError::LogProcessing(
+                    format!("SCID verification failed at line {}: {}", line_idx + 1, e)
+                ))?;
+        }
+        
+        // Verify the entry hash, providing the previous entry's versionId if not the first entry
+        let prev_version_id = if is_first_entry {
+            None
+        } else {
+            Some(did_log.entries.last().unwrap().version_id.as_str())
+        };
+        
+        verify_entry_hash(&entry, prev_version_id)
+            .map_err(|e| ResolverError::LogProcessing(
+                format!("Entry hash verification failed at line {}: {}", line_idx + 1, e)
+            ))?;
+        
+        // If pre-rotation is active, verify that update keys match previous nextKeyHashes
+        if !is_first_entry {
+            if let (Some(update_keys), Some(prev_next_key_hashes)) = (
+                &entry.parameters.update_keys,
+                &did_log.active_parameters.next_key_hashes
+            ) {
+                verify_prerotation(update_keys, prev_next_key_hashes)
+                    .map_err(|e| ResolverError::LogProcessing(
+                        format!("Pre-rotation verification failed at line {}: {}", line_idx + 1, e)
+                    ))?;
+            }
+        }
+        
+        // Update active parameters, passing is_first_entry flag
+        update_active_parameters(&mut did_log.active_parameters, &entry.parameters, is_first_entry);
+        
+        // Add the entry to the log
+        did_log.version_id_map.insert(entry.version_id.clone(), did_log.entries.len());
+        did_log.entries.push(entry);
+    }
+    
+    // Validate that the log has at least one entry
+    if did_log.entries.is_empty() {
+        return Err(ResolverError::LogProcessing("DID log is empty".to_string()));
+    }
+    
+    Ok(did_log)
+}
+
+/// Validate the structure of a DID log entry
+fn validate_entry_structure(entry: &DIDLogEntry, entry_index: usize) -> Result<()> {
+    // Check that versionId is present and has the correct format
+    let version_id_parts: Vec<&str> = entry.version_id.split('-').collect();
+    if version_id_parts.len() != 2 {
+        return Err(ResolverError::LogProcessing(
+            format!("Invalid versionId format: {}", entry.version_id)
+        ));
+    }
+    
+    // Check that version number is valid
+    let version_number = version_id_parts[0].parse::<u64>().map_err(|_| {
+        ResolverError::LogProcessing(
+            format!("Invalid version number in versionId: {}", entry.version_id)
+        )
+    })?;
+    
+    // Check that version number matches the expected sequence
+    let expected_version = entry_index as u64 + 1;
+    if version_number != expected_version {
+        return Err(ResolverError::LogProcessing(
+            format!("Version number {} does not match expected sequence number {}", 
+                   version_number, expected_version)
+        ));
+    }
+    
+    // Check that versionTime is present
+    if entry.version_time.is_empty() {
+        return Err(ResolverError::LogProcessing(
+            "Missing versionTime".to_string()
+        ));
+    }
+    
+    // Check that state (DID Document) is present
+    if !entry.state.is_object() {
+        return Err(ResolverError::LogProcessing(
+            "Invalid or missing DID Document in state".to_string()
+        ));
+    }
+    
+    // Check that there is at least one proof
+    if entry.proof.is_empty() {
+        return Err(ResolverError::LogProcessing(
+            "Missing proof".to_string()
+        ));
+    }
+    
+    // First entry specific checks
+    if entry_index == 0 {
+        // Check that the first entry has an SCID parameter
+        if entry.parameters.scid.is_none() {
+            return Err(ResolverError::LogProcessing(
+                "First entry is missing required SCID parameter".to_string()
+            ));
+        }
+        
+        // Check that the first entry has a method parameter
+        if entry.parameters.method.is_none() {
+            return Err(ResolverError::LogProcessing(
+                "First entry is missing required method parameter".to_string()
+            ));
+        }
+        
+        // Check that the first entry has update keys and at least one key
+        if entry.parameters.update_keys.is_none() || 
+           entry.parameters.update_keys.as_ref().unwrap().is_empty() {
+            return Err(ResolverError::LogProcessing(
+                "First entry is missing required updateKeys parameter or has empty updateKeys".to_string()
+            ));
+        }
+    }
+    
+    Ok(())
+}
+
+/// Update active parameters with new parameter values
+fn update_active_parameters(active_params: &mut Parameters, new_params: &Parameters, is_first_entry: bool) {
+    // Note on parameter timing effects:
+    // Some parameters take effect immediately, others only after publication.
+    // We follow these rules based on the did:webvh specification:
+    //
+    // Parameters that take effect immediately (in all entries):
+    // - method, scid, portable, deactivated, ttl
+    //
+    // Parameters with special timing rules:
+    // - update_keys: Takes effect immediately in first entry, but for subsequent entries,
+    //   takes effect only after publication (must be signed by previous entry's keys)
+    // - witness: Takes effect immediately in first entry, but for subsequent entries,
+    //   takes effect only after publication (must be witnessed by previous entry's witnesses)
+    // - next_key_hashes: Takes effect immediately (used to verify next entry's update_keys)
+
+    // Update method if present (takes effect immediately)
+    if let Some(method) = &new_params.method {
+        active_params.method = Some(method.clone());
+    }
+    
+    // Update SCID if present (takes effect immediately)
+    if let Some(scid) = &new_params.scid {
+        active_params.scid = Some(scid.clone());
+    }
+    
+    // Update update keys if present (timing depends on whether it's the first entry)
+    if let Some(update_keys) = &new_params.update_keys {
+        active_params.update_keys = Some(update_keys.clone());
+        // Note: For non-first entries, these keys will only be used to verify
+        // the *next* entry, not the current one
+    }
+    
+    // Update next key hashes if present
+    if let Some(next_key_hashes) = &new_params.next_key_hashes {
+        active_params.next_key_hashes = Some(next_key_hashes.clone());
+    }
+    
+    // Update portable flag if present (takes effect immediately)
+    if let Some(portable) = new_params.portable {
+        active_params.portable = Some(portable);
+    }
+    
+    // Update witness configuration if present (timing depends on whether it's the first entry)
+    if new_params.witness.is_some() {
+        active_params.witness = new_params.witness.clone();
+        // Note: For non-first entries, this witness configuration will only be used
+        // for the *next* entry, not the current one
+    }
+    
+    // Update deactivated flag if present (takes effect immediately)
+    if new_params.deactivated.is_some() {
+        active_params.deactivated = new_params.deactivated;
+    }
+    
+    // Update TTL if present (takes effect immediately)
+    if new_params.ttl.is_some() {
+        active_params.ttl = new_params.ttl;
+    }
+}
+
+/// Fetch and parse a DID log
+pub async fn fetch_and_parse_did_log<C: HttpClient>(
+    http_client: &C,
+    did_url: &DIDUrl
+) -> Result<DIDLog> {
+    // Convert DID URL to HTTPS URL for the DID log
+    let https_url = did_url.to_https_url()?;
+    
+    // Fetch the DID log
+    let log_bytes = http_client.get(https_url.as_str(), None).await?;
+    
+    // Parse the DID log
+    parse_did_log(&log_bytes, &did_url.did_url)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{http::tests::MockHttpClientMock, Proof, Witness, WitnessConfig};
+    
+    #[test]
+    fn test_parse_valid_did_log() {
+        // Simple valid DID log with two entries
+        let log_str = r#"{"versionId": "1-QmQq6Kg4ZZ1p49znzxnWmes4LkkWgMWLrnrfPre8UD56bz", "versionTime": "2024-09-26T23:22:26Z", "parameters": {"method": "did:webvh:0.5", "scid": "QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ", "updateKeys": ["z6MkhbNRN2Q9BaY9TvTc2K3izkhfVwgHiXL7VWZnTqxEvc3R"], "nextKeyHashes": ["QmXC3vvStVVzCBHRHGUsksGxn6BNmkdETXJGDBXwNSTL33"]}, "state": {"@context": ["https://www.w3.org/ns/did/v1"], "id": "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:domain.example"}, "proof": [{"type": "DataIntegrityProof", "cryptosuite": "eddsa-jcs-2022", "verificationMethod": "did:key:z6MkhbNRN2Q9BaY9TvTc2K3izkhfVwgHiXL7VWZnTqxEvc3R#z6MkhbNRN2Q9BaY9TvTc2K3izkhfVwgHiXL7VWZnTqxEvc3R", "created": "2024-09-26T23:22:26Z", "proofPurpose": "assertionMethod", "proofValue": "z2fPF6fMewtV15kji2N432R7RjmmFs8p7MiSHSTM9FoVmJPtc3JUuZ472pZKoWgZDuT75EDwkGmZbK8ZKVF55pXvx"}]}
+{"versionId": "2-QmXL6CLK1BMHAd3zQMqkY49VSc9T3zhUcPxu6zEW176PfN", "versionTime": "2024-09-27T10:15:30Z", "parameters": {"updateKeys": ["z6MkvQnUuQn3s52dw4FF3T87sfaTvXRW7owE1QMvFwpag2Bf"], "nextKeyHashes": ["QmdA9fxQSLLwCQo6TkovcoaLgGYWq6Ttqx6A5D1RY13iFG"]}, "state": {"@context": ["https://www.w3.org/ns/did/v1"], "id": "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:domain.example"}, "proof": [{"type": "DataIntegrityProof", "cryptosuite": "eddsa-jcs-2022", "verificationMethod": "did:key:z6MkhbNRN2Q9BaY9TvTc2K3izkhfVwgHiXL7VWZnTqxEvc3R#z6MkhbNRN2Q9BaY9TvTc2K3izkhfVwgHiXL7VWZnTqxEvc3R", "created": "2024-09-27T10:15:30Z", "proofPurpose": "assertionMethod", "proofValue": "z2nkLj9rYAMG7TStpvihuo4HTovpC7uvWcDoYiGhoN8cqQuiwW2EnPZdWtid2FZAQDQPoaNkTooKVftGKDTh9p3Fy"}]}"#;
+        
+        let log = parse_did_log(log_str.as_bytes(), "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:domain.example").unwrap();
+        
+        // Check that the log has two entries
+        assert_eq!(log.entries.len(), 2);
+        
+        // Check that the version IDs are correctly parsed
+        assert_eq!(log.entries[0].version_id, "1-QmQq6Kg4ZZ1p49znzxnWmes4LkkWgMWLrnrfPre8UD56bz");
+        assert_eq!(log.entries[1].version_id, "2-QmXL6CLK1BMHAd3zQMqkY49VSc9T3zhUcPxu6zEW176PfN");
+        
+        // Check that active parameters are updated correctly
+        assert_eq!(log.active_parameters.method, Some("did:webvh:0.5".to_string()));
+        assert_eq!(log.active_parameters.scid, Some("QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ".to_string()));
+        assert_eq!(log.active_parameters.update_keys, Some(vec!["z6MkvQnUuQn3s52dw4FF3T87sfaTvXRW7owE1QMvFwpag2Bf".to_string()]));
+        
+        // Check that version_id_map is correctly populated
+        assert_eq!(log.version_id_map.len(), 2);
+        assert_eq!(log.version_id_map.get("1-QmQq6Kg4ZZ1p49znzxnWmes4LkkWgMWLrnrfPre8UD56bz"), Some(&0));
+        assert_eq!(log.version_id_map.get("2-QmXL6CLK1BMHAd3zQMqkY49VSc9T3zhUcPxu6zEW176PfN"), Some(&1));
+        
+        // Test accessor methods
+        assert_eq!(log.latest_entry().unwrap().version_id, "2-QmXL6CLK1BMHAd3zQMqkY49VSc9T3zhUcPxu6zEW176PfN");
+        assert_eq!(
+            log.get_entry_by_version_id("1-QmQq6Kg4ZZ1p49znzxnWmes4LkkWgMWLrnrfPre8UD56bz").unwrap().version_id,
+            "1-QmQq6Kg4ZZ1p49znzxnWmes4LkkWgMWLrnrfPre8UD56bz"
+        );
+        assert_eq!(log.get_entry_by_version_number(1).unwrap().version_id, "1-QmQq6Kg4ZZ1p49znzxnWmes4LkkWgMWLrnrfPre8UD56bz");
+        assert_eq!(
+            log.get_entry_by_version_time("2024-09-27T00:00:00Z").unwrap().version_id,
+            "1-QmQq6Kg4ZZ1p49znzxnWmes4LkkWgMWLrnrfPre8UD56bz"
+        );
+        
+        // Test metadata generation
+        let metadata = log.generate_metadata(&log.entries[0]);
+        assert_eq!(metadata.created, Some("2024-09-26T23:22:26Z".to_string()));
+        assert_eq!(metadata.updated, Some("2024-09-26T23:22:26Z".to_string()));
+        assert_eq!(metadata.version_id, Some("1-QmQq6Kg4ZZ1p49znzxnWmes4LkkWgMWLrnrfPre8UD56bz".to_string()));
+        assert_eq!(metadata.next_version_id, Some("2-QmXL6CLK1BMHAd3zQMqkY49VSc9T3zhUcPxu6zEW176PfN".to_string()));
+    }
+    
+    #[test]
+    fn test_parse_invalid_did_log() {
+        // Test missing required parameters in first entry
+        let log_str = r#"{"versionId": "1-QmQq6Kg4ZZ1p49znzxnWmes4LkkWgMWLrnrfPre8UD56bz", "versionTime": "2024-09-26T23:22:26Z", "parameters": {}, "state": {"@context": ["https://www.w3.org/ns/did/v1"], "id": "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:domain.example"}, "proof": [{"type": "DataIntegrityProof", "cryptosuite": "eddsa-jcs-2022", "verificationMethod": "did:key:z6MkhbNRN2Q9BaY9TvTc2K3izkhfVwgHiXL7VWZnTqxEvc3R#z6MkhbNRN2Q9BaY9TvTc2K3izkhfVwgHiXL7VWZnTqxEvc3R", "created": "2024-09-26T23:22:26Z", "proofPurpose": "assertionMethod", "proofValue": "z2fPF6fMewtV15kji2N432R7RjmmFs8p7MiSHSTM9FoVmJPtc3JUuZ472pZKoWgZDuT75EDwkGmZbK8ZKVF55pXvx"}]}"#;
+        
+        let result = parse_did_log(log_str.as_bytes(), "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:domain.example");
+        assert!(result.is_err());
+        
+        // Test invalid version number sequence
+        let log_str = r#"{"versionId": "1-QmQq6Kg4ZZ1p49znzxnWmes4LkkWgMWLrnrfPre8UD56bz", "versionTime": "2024-09-26T23:22:26Z", "parameters": {"method": "did:webvh:0.5", "scid": "QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ", "updateKeys": ["z6MkhbNRN2Q9BaY9TvTc2K3izkhfVwgHiXL7VWZnTqxEvc3R"]}, "state": {"@context": ["https://www.w3.org/ns/did/v1"], "id": "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:domain.example"}, "proof": [{"type": "DataIntegrityProof", "cryptosuite": "eddsa-jcs-2022", "verificationMethod": "did:key:z6MkhbNRN2Q9BaY9TvTc2K3izkhfVwgHiXL7VWZnTqxEvc3R#z6MkhbNRN2Q9BaY9TvTc2K3izkhfVwgHiXL7VWZnTqxEvc3R", "created": "2024-09-26T23:22:26Z", "proofPurpose": "assertionMethod", "proofValue": "z2fPF6fMewtV15kji2N432R7RjmmFs8p7MiSHSTM9FoVmJPtc3JUuZ472pZKoWgZDuT75EDwkGmZbK8ZKVF55pXvx"}]}
+{"versionId": "3-QmXL6CLK1BMHAd3zQMqkY49VSc9T3zhUcPxu6zEW176PfN", "versionTime": "2024-09-27T10:15:30Z", "parameters": {}, "state": {"@context": ["https://www.w3.org/ns/did/v1"], "id": "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:domain.example"}, "proof": [{"type": "DataIntegrityProof", "cryptosuite": "eddsa-jcs-2022", "verificationMethod": "did:key:z6MkhbNRN2Q9BaY9TvTc2K3izkhfVwgHiXL7VWZnTqxEvc3R#z6MkhbNRN2Q9BaY9TvTc2K3izkhfVwgHiXL7VWZnTqxEvc3R", "created": "2024-09-27T10:15:30Z", "proofPurpose": "assertionMethod", "proofValue": "z2nkLj9rYAMG7TStpvihuo4HTovpC7uvWcDoYiGhoN8cqQuiwW2EnPZdWtid2FZAQDQPoaNkTooKVftGKDTh9p3Fy"}]}"#;
+        
+        let result = parse_did_log(log_str.as_bytes(), "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:domain.example");
+        assert!(result.is_err());
+        
+        // Test missing proof
+        let log_str = r#"{"versionId": "1-QmQq6Kg4ZZ1p49znzxnWmes4LkkWgMWLrnrfPre8UD56bz", "versionTime": "2024-09-26T23:22:26Z", "parameters": {"method": "did:webvh:0.5", "scid": "QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ", "updateKeys": ["z6MkhbNRN2Q9BaY9TvTc2K3izkhfVwgHiXL7VWZnTqxEvc3R"]}, "state": {"@context": ["https://www.w3.org/ns/did/v1"], "id": "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:domain.example"}, "proof": []}"#;
+        
+        let result = parse_did_log(log_str.as_bytes(), "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:domain.example");
+        assert!(result.is_err());
+    }
+    #[test]
+    fn test_update_parameters_first_entry() {
+        // Create base parameters
+        let mut active_params = Parameters::default();
+        
+        // Create parameters for first entry
+        let first_entry_params = Parameters {
+            method: Some("did:webvh:0.5".to_string()),
+            scid: Some("QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ".to_string()),
+            update_keys: Some(vec!["key1".to_string()]),
+            witness: Some(WitnessConfig {
+                threshold: 1,
+                witnesses: vec![Witness { id: "witness1".to_string() }],
+            }),
+            portable: Some(true),
+            next_key_hashes: Some(vec!["hash1".to_string()]),
+            deactivated: None,
+            ttl: None,
+        };
+        
+        // Update with first entry parameters (is_first_entry = true)
+        update_active_parameters(&mut active_params, &first_entry_params, true);
+        
+        // Check that all parameters are updated correctly
+        assert_eq!(active_params.method, Some("did:webvh:0.5".to_string()));
+        assert_eq!(active_params.scid, Some("QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ".to_string()));
+        assert_eq!(active_params.update_keys, Some(vec!["key1".to_string()]));
+        assert_eq!(active_params.witness.as_ref().unwrap().threshold, 1);
+        assert_eq!(active_params.portable, Some(true));
+        assert_eq!(active_params.next_key_hashes, Some(vec!["hash1".to_string()]));
+    }
+
+    #[test]
+    fn test_update_parameters_subsequent_entry() {
+        // Create base parameters (simulating active state after first entry)
+        let mut active_params = Parameters {
+            method: Some("did:webvh:0.5".to_string()),
+            scid: Some("QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ".to_string()),
+            update_keys: Some(vec!["old_key".to_string()]),
+            witness: Some(WitnessConfig {
+                threshold: 1,
+                witnesses: vec![Witness { id: "old_witness".to_string() }],
+            }),
+            portable: Some(true),
+            next_key_hashes: Some(vec!["old_hash".to_string()]),
+            deactivated: None,
+            ttl: None,
+        };
+        
+        // Create parameters for subsequent entry
+        let new_entry_params = Parameters {
+            update_keys: Some(vec!["new_key".to_string()]),
+            witness: Some(WitnessConfig {
+                threshold: 2,
+                witnesses: vec![Witness { id: "new_witness".to_string() }],
+            }),
+            next_key_hashes: Some(vec!["new_hash".to_string()]),
+            deactivated: Some(true),
+            ttl: Some(3600),
+            ..Parameters::default()
+        };
+        
+        // Update with subsequent entry parameters (is_first_entry = false)
+        update_active_parameters(&mut active_params, &new_entry_params, false);
+        
+        // Check that parameters are updated correctly
+        // Method and SCID should remain unchanged
+        assert_eq!(active_params.method, Some("did:webvh:0.5".to_string()));
+        assert_eq!(active_params.scid, Some("QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ".to_string()));
+        
+        // These parameters should be updated
+        assert_eq!(active_params.update_keys, Some(vec!["new_key".to_string()]));
+        assert_eq!(active_params.witness.as_ref().unwrap().threshold, 2);
+        assert_eq!(active_params.next_key_hashes, Some(vec!["new_hash".to_string()]));
+        assert_eq!(active_params.deactivated, Some(true));
+        assert_eq!(active_params.ttl, Some(3600));
+    }
+
+    #[test]
+    fn test_validate_first_entry_missing_update_keys() {
+        // Create an entry with missing update_keys
+        let entry = DIDLogEntry {
+            version_id: "1-QmQq6Kg4ZZ1p49znzxnWmes4LkkWgMWLrnrfPre8UD56bz".to_string(),
+            version_time: "2024-09-26T23:22:26Z".to_string(),
+            parameters: Parameters {
+                method: Some("did:webvh:0.5".to_string()),
+                scid: Some("QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ".to_string()),
+                update_keys: None, // Missing update_keys
+                ..Parameters::default()
+            },
+            state: serde_json::json!({
+                "@context": ["https://www.w3.org/ns/did/v1"],
+                "id": "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:example.com"
+            }),
+            proof: vec![Proof {
+                type_: "DataIntegrityProof".to_string(),
+                cryptosuite: "eddsa-jcs-2022".to_string(),
+                verification_method: "did:key:z6MkhbNRN2Q9BaY9TvTc2K3izkhfVwgHiXL7VWZnTqxEvc3R#z6MkhbNRN2Q9BaY9TvTc2K3izkhfVwgHiXL7VWZnTqxEvc3R".to_string(),
+                created: "2024-09-26T23:22:26Z".to_string(),
+                proof_purpose: "assertionMethod".to_string(),
+                proof_value: "z2fPF6fMewtV15kji2N432R7RjmmFs8p7MiSHSTM9FoVmJPtc3JUuZ472pZKoWgZDuT75EDwkGmZbK8ZKVF55pXvx".to_string(),
+            }],
+        };
+        
+        // Validate as the first entry (entry_index = 0)
+        let result = validate_entry_structure(&entry, 0);
+        
+        // Should fail with error about missing updateKeys
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("updateKeys"));
+    }
+
+    #[test]
+    fn test_validate_first_entry_empty_update_keys() {
+        // Create an entry with empty update_keys array
+        let entry = DIDLogEntry {
+            version_id: "1-QmQq6Kg4ZZ1p49znzxnWmes4LkkWgMWLrnrfPre8UD56bz".to_string(),
+            version_time: "2024-09-26T23:22:26Z".to_string(),
+            parameters: Parameters {
+                method: Some("did:webvh:0.5".to_string()),
+                scid: Some("QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ".to_string()),
+                update_keys: Some(vec![]), // Empty update_keys array
+                ..Parameters::default()
+            },
+            state: serde_json::json!({
+                "@context": ["https://www.w3.org/ns/did/v1"],
+                "id": "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:example.com"
+            }),
+            proof: vec![Proof {
+                type_: "DataIntegrityProof".to_string(),
+                cryptosuite: "eddsa-jcs-2022".to_string(),
+                verification_method: "did:key:z6MkhbNRN2Q9BaY9TvTc2K3izkhfVwgHiXL7VWZnTqxEvc3R#z6MkhbNRN2Q9BaY9TvTc2K3izkhfVwgHiXL7VWZnTqxEvc3R".to_string(),
+                created: "2024-09-26T23:22:26Z".to_string(),
+                proof_purpose: "assertionMethod".to_string(),
+                proof_value: "z2fPF6fMewtV15kji2N432R7RjmmFs8p7MiSHSTM9FoVmJPtc3JUuZ472pZKoWgZDuT75EDwkGmZbK8ZKVF55pXvx".to_string(),
+            }],
+        };
+        
+        // Validate as the first entry (entry_index = 0)
+        let result = validate_entry_structure(&entry, 0);
+        
+        // Should fail with error about empty updateKeys
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("empty updateKeys"));
+    }
+
+    #[test]
+    fn test_parse_did_log_with_parameter_updates() {
+        // Create a DID log with multiple entries that update different parameters
+        let log_str = r#"{"versionId": "1-QmQq6Kg4ZZ1p49znzxnWmes4LkkWgMWLrnrfPre8UD56bz", "versionTime": "2024-09-26T23:22:26Z", "parameters": {"method": "did:webvh:0.5", "scid": "QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ", "updateKeys": ["key1"], "portable": true}, "state": {"@context": ["https://www.w3.org/ns/did/v1"], "id": "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:example.com"}, "proof": [{"type": "DataIntegrityProof", "cryptosuite": "eddsa-jcs-2022", "verificationMethod": "did:key:z6MkhbNRN2Q9BaY9TvTc2K3izkhfVwgHiXL7VWZnTqxEvc3R#z6MkhbNRN2Q9BaY9TvTc2K3izkhfVwgHiXL7VWZnTqxEvc3R", "created": "2024-09-26T23:22:26Z", "proofPurpose": "assertionMethod", "proofValue": "z2fPF6fMewtV15kji2N432R7RjmmFs8p7MiSHSTM9FoVmJPtc3JUuZ472pZKoWgZDuT75EDwkGmZbK8ZKVF55pXvx"}]}
+    {"versionId": "2-QmXL6CLK1BMHAd3zQMqkY49VSc9T3zhUcPxu6zEW176PfN", "versionTime": "2024-09-27T10:15:30Z", "parameters": {"updateKeys": ["key2"], "ttl": 3600}, "state": {"@context": ["https://www.w3.org/ns/did/v1"], "id": "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:example.com"}, "proof": [{"type": "DataIntegrityProof", "cryptosuite": "eddsa-jcs-2022", "verificationMethod": "did:key:z6MkhbNRN2Q9BaY9TvTc2K3izkhfVwgHiXL7VWZnTqxEvc3R#z6MkhbNRN2Q9BaY9TvTc2K3izkhfVwgHiXL7VWZnTqxEvc3R", "created": "2024-09-27T10:15:30Z", "proofPurpose": "assertionMethod", "proofValue": "z2nkLj9rYAMG7TStpvihuo4HTovpC7uvWcDoYiGhoN8cqQuiwW2EnPZdWtid2FZAQDQPoaNkTooKVftGKDTh9p3Fy"}]}
+    {"versionId": "3-QmaSKJRACGefmi19LkS6TFj5FeMEfr98GpBWk7vEmbhT92", "versionTime": "2024-09-28T14:35:12Z", "parameters": {"deactivated": true}, "state": {"@context": ["https://www.w3.org/ns/did/v1"], "id": "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:example.com"}, "proof": [{"type": "DataIntegrityProof", "cryptosuite": "eddsa-jcs-2022", "verificationMethod": "did:key:z6MkvQnUuQn3s52dw4FF3T87sfaTvXRW7owE1QMvFwpag2Bf#z6MkvQnUuQn3s52dw4FF3T87sfaTvXRW7owE1QMvFwpag2Bf", "created": "2024-09-28T14:35:12Z", "proofPurpose": "assertionMethod", "proofValue": "z2V72e7bRFpjvphDcWfYeSDTLsbkoVU5SfWAKMwpxYAL74D8GugTuoB2vH93cJqb8XXz8tN4es9AM787CogcbmXKa"}]}"#;
+        
+        let did_log = parse_did_log(log_str.as_bytes(), "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:example.com").unwrap();
+        
+        // Check that the final active parameters are correctly accumulated
+        assert_eq!(did_log.active_parameters.method, Some("did:webvh:0.5".to_string()));
+        assert_eq!(did_log.active_parameters.scid, Some("QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ".to_string()));
+        assert_eq!(did_log.active_parameters.update_keys, Some(vec!["key2".to_string()]));
+        assert_eq!(did_log.active_parameters.portable, Some(true));
+        assert_eq!(did_log.active_parameters.ttl, Some(3600));
+        assert_eq!(did_log.active_parameters.deactivated, Some(true));
+    }
+}
+
+================
+File: src/resolver/mod.rs
+================
+//! Module for resolving did:webvh DIDs.
+//! 
+//! This module provides the main resolver implementation and related functionality.
+
+use crate::error::{ResolverError, ResolutionError, Result, ResolutionResult};
+use crate::http::HttpClient;
+use crate::log::{DIDLog, fetch_and_parse_did_log};
+use crate::types::{DIDResolutionResult, DIDResolutionMetadata, DIDDocumentMetadata, ResolutionOptions};
+use crate::url::DIDUrl;
+use serde_json::Value;
+use std::sync::Arc;
+
+/// Implementation of the did:webvh resolver
+pub struct WebVHResolver<C: HttpClient> {
+    http_client: Arc<C>,
+}
+
+impl<C: HttpClient> WebVHResolver<C> {
+    /// Create a new WebVHResolver with the provided HTTP client
+    pub fn new(http_client: C) -> Self {
+        Self {
+            http_client: Arc::new(http_client),
+        }
+    }
+    
+    /// Resolve a did:webvh DID
+    pub async fn resolve(&self, did: &str, options: &ResolutionOptions) -> ResolutionResult<DIDResolutionResult> {
+        // Parse the DID URL
+        let did_url = DIDUrl::parse(did).map_err(|e| {
+            ResolutionError::InvalidDID(format!("Invalid DID URL: {}", e))
+        })?;
+        
+        // Fetch and parse the DID log
+        let did_log = fetch_and_parse_did_log(Arc::clone(&self.http_client).as_ref(), &did_url).await
+            .map_err(|e| match e {
+                ResolverError::Http(msg) if msg.contains("not found") => {
+                    ResolutionError::NotFound
+                },
+                _ => ResolutionError::InternalError(format!("Error fetching DID log: {}", e)),
+            })?;
+        
+        // Find the requested entry based on resolution options
+        let entry = if let Some(version_id) = &options.version_id {
+            // Resolve by version ID
+            did_log.get_entry_by_version_id(version_id)
+                .ok_or_else(|| ResolutionError::NotFound)?
+        } else if let Some(version_time) = &options.version_time {
+            // Resolve by version time
+            did_log.get_entry_by_version_time(version_time)
+                .ok_or_else(|| ResolutionError::NotFound)?
+        } else if let Some(version_number) = options.version_number {
+            // Resolve by version number
+            did_log.get_entry_by_version_number(version_number)
+                .ok_or_else(|| ResolutionError::NotFound)?
+        } else {
+            // Default to latest entry
+            did_log.latest_entry()
+                .ok_or_else(|| ResolutionError::InternalError("DID log is empty".to_string()))?
+        };
+        
+        // Extract the DID document from the entry
+        let did_document = entry.state.clone();
+        
+        // Generate DID document metadata
+        let did_document_metadata = did_log.generate_metadata(entry);
+        
+        // Create resolution metadata
+        let mut did_resolution_metadata = DIDResolutionMetadata::default();
+        did_resolution_metadata.content_type = "application/did+json".to_string();
+        
+        // Ensure the DID document has an ID that matches the resolved DID
+        if let Some(id) = extract_did_id(&did_document) {
+            if !is_did_match(&id, did) {
+                // For portable DIDs, check if the resolved DID is in alsoKnownAs
+                if did_log.active_parameters.portable.unwrap_or(false) {
+                    if !is_did_in_also_known_as(&did_document, did) {
+                        return Err(ResolutionError::InvalidDIDDocument(
+                            format!("DID document ID {} does not match resolved DID {} and is not in alsoKnownAs", id, did)
+                        ));
+                    }
+                } else {
+                    return Err(ResolutionError::InvalidDIDDocument(
+                        format!("DID document ID {} does not match resolved DID {}", id, did)
+                    ));
+                }
+            }
+        } else {
+            return Err(ResolutionError::InvalidDIDDocument(
+                "DID document is missing id property".to_string()
+            ));
+        }
+        
+        // Return the resolution result
+        Ok(DIDResolutionResult {
+            did_document,
+            did_document_metadata,
+            did_resolution_metadata,
+        })
+    }
+}
+
+/// Extract the DID ID from a DID document
+fn extract_did_id(did_document: &Value) -> Option<String> {
+    did_document.get("id")?.as_str().map(|s| s.to_string())
+}
+
+/// Check if a DID is in the alsoKnownAs array of a DID document
+fn is_did_in_also_known_as(did_document: &Value, did: &str) -> bool {
+    if let Some(Value::Array(aka)) = did_document.get("alsoKnownAs") {
+        aka.iter().any(|v| {
+            v.as_str().map_or(false, |s| s == did)
+        })
+    } else {
+        false
+    }
+}
+
+/// Check if two DIDs match (ignoring query and fragment)
+fn is_did_match(did1: &str, did2: &str) -> bool {
+    // Remove query and fragment for comparison
+    let did1_base = did1.split(&['?', '#'][..]).next().unwrap_or(did1);
+    let did2_base = did2.split(&['?', '#'][..]).next().unwrap_or(did2);
+    
+    did1_base == did2_base
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http::tests::MockHttpClientMock;
+    use mockall::predicate::{self, *};
+    
+    #[test]
+    fn test_extract_did_id() {
+        let did_document = serde_json::json!({
+            "@context": ["https://www.w3.org/ns/did/v1"],
+            "id": "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:example.com"
+        });
+        
+        let id = extract_did_id(&did_document).unwrap();
+        assert_eq!(id, "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:example.com");
+        
+        let empty_doc = serde_json::json!({});
+        assert!(extract_did_id(&empty_doc).is_none());
+    }
+    
+    #[test]
+    fn test_is_did_in_also_known_as() {
+        let did_document = serde_json::json!({
+            "@context": ["https://www.w3.org/ns/did/v1"],
+            "id": "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:example.com",
+            "alsoKnownAs": [
+                "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:old-domain.com",
+                "did:web:example.com"
+            ]
+        });
+        
+        assert!(is_did_in_also_known_as(&did_document, "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:old-domain.com"));
+        assert!(is_did_in_also_known_as(&did_document, "did:web:example.com"));
+        assert!(!is_did_in_also_known_as(&did_document, "did:web:other.com"));
+        
+        let no_aka_doc = serde_json::json!({
+            "@context": ["https://www.w3.org/ns/did/v1"],
+            "id": "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:example.com"
+        });
+        
+        assert!(!is_did_in_also_known_as(&no_aka_doc, "did:web:example.com"));
+    }
+    
+    #[test]
+    fn test_is_did_match() {
+        // Basic matching
+        assert!(is_did_match(
+            "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:example.com",
+            "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:example.com"
+        ));
+        
+        // Different DIDs
+        assert!(!is_did_match(
+            "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:example.com",
+            "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:other.com"
+        ));
+        
+        // Matching with query/fragment ignored
+        assert!(is_did_match(
+            "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:example.com?versionId=1",
+            "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:example.com#key-1"
+        ));
+    }
+    
+    #[tokio::test]
+    async fn test_resolver_basic_resolution() {
+        let mut mock_client = MockHttpClientMock::new();
+        
+        // Set up the mock to return a valid DID log
+        let log_str = r#"{"versionId": "1-QmQq6Kg4ZZ1p49znzxnWmes4LkkWgMWLrnrfPre8UD56bz", "versionTime": "2024-09-26T23:22:26Z", "parameters": {"method": "did:webvh:0.5", "scid": "QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ", "updateKeys": ["z6MkhbNRN2Q9BaY9TvTc2K3izkhfVwgHiXL7VWZnTqxEvc3R"]}, "state": {"@context": ["https://www.w3.org/ns/did/v1"], "id": "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:example.com"}, "proof": [{"type": "DataIntegrityProof", "cryptosuite": "eddsa-jcs-2022", "verificationMethod": "did:key:z6MkhbNRN2Q9BaY9TvTc2K3izkhfVwgHiXL7VWZnTqxEvc3R#z6MkhbNRN2Q9BaY9TvTc2K3izkhfVwgHiXL7VWZnTqxEvc3R", "created": "2024-09-26T23:22:26Z", "proofPurpose": "assertionMethod", "proofValue": "z2fPF6fMewtV15kji2N432R7RjmmFs8p7MiSHSTM9FoVmJPtc3JUuZ472pZKoWgZDuT75EDwkGmZbK8ZKVF55pXvx"}]}"#;
+        
+        // Set up the mock expectation for any URL with did.jsonl
+        mock_client
+            .expect_get()
+            .with(predicate::function(|url: &str| url.contains("did.jsonl")), eq(None))
+            .times(1)
+            .returning(move |_, _| Ok(log_str.as_bytes().to_vec()));
+        
+        // Create the resolver
+        let resolver = WebVHResolver::new(mock_client);
+        
+        // Resolve the DID
+        let result = resolver.resolve(
+            "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:example.com", 
+            &ResolutionOptions::default()
+        ).await;
+        
+        assert!(result.is_ok());
+        
+        let resolution_result = result.unwrap();
+        assert_eq!(
+            resolution_result.did_document.get("id").unwrap().as_str().unwrap(),
+            "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:example.com"
+        );
+        assert_eq!(
+            resolution_result.did_document_metadata.version_id,
+            Some("1-QmQq6Kg4ZZ1p49znzxnWmes4LkkWgMWLrnrfPre8UD56bz".to_string())
+        );
+        assert_eq!(
+            resolution_result.did_resolution_metadata.content_type,
+            "application/did+json"
+        );
+    }
+}
+
+================
+File: src/types/mod.rs
+================
+//! Core data types for the didwebvh-resolver crate.
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashMap;
+
+/// A DID Log Entry representing one version of a DID Document
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DIDLogEntry {
+    /// Format: "<version-number>-<entry-hash>"
+    #[serde(rename = "versionId")]
+    pub version_id: String,
+    
+    /// ISO8601 timestamp
+    #[serde(rename = "versionTime")]
+    pub version_time: String,
+    
+    /// DID method parameters
+    pub parameters: Parameters,
+    
+    /// The DID Document as a JSON value
+    pub state: Value,
+    
+    /// Data Integrity proofs
+    pub proof: Vec<Proof>,
+}
+
+/// Parameters that control DID processing
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Parameters {
+    /// Specification version (e.g., "did:webvh:0.5")
+    pub method: Option<String>,
+    
+    /// Self-certifying identifier
+    pub scid: Option<String>,
+    
+    /// Keys authorized for updates
+    #[serde(rename = "updateKeys")]
+    pub update_keys: Option<Vec<String>>,
+    
+    /// Pre-rotation key hashes
+    #[serde(rename = "nextKeyHashes")]
+    pub next_key_hashes: Option<Vec<String>>,
+    
+    /// DID portability flag
+    pub portable: Option<bool>,
+    
+    /// Witness configuration
+    pub witness: Option<WitnessConfig>,
+    
+    /// Deactivation status
+    pub deactivated: Option<bool>,
+    
+    /// Cache TTL in seconds
+    pub ttl: Option<u64>,
+}
+
+/// Witness configuration for collaborative verification
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WitnessConfig {
+    /// Number of witnesses required
+    pub threshold: u64,
+    
+    /// List of witnesses
+    pub witnesses: Vec<Witness>,
+}
+
+/// A witness entry
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Witness {
+    /// DID of the witness
+    pub id: String,
+}
+
+/// Proof using Data Integrity
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Proof {
+    /// Type of proof (e.g., "DataIntegrityProof")
+    #[serde(rename = "type")]
+    pub type_: String,
+    
+    /// Cryptosuite used (e.g., "eddsa-jcs-2022")
+    pub cryptosuite: String,
+    
+    /// The key used
+    #[serde(rename = "verificationMethod")]
+    pub verification_method: String,
+    
+    /// Creation timestamp
+    pub created: String,
+    
+    /// Purpose (e.g., "assertionMethod")
+    #[serde(rename = "proofPurpose")]
+    pub proof_purpose: String,
+    
+    /// The actual proof value
+    #[serde(rename = "proofValue")]
+    pub proof_value: String,
+}
+
+/// Witness proof file structure
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WitnessProofs {
+    /// List of witness proof entries
+    pub entries: Vec<WitnessProofEntry>,
+}
+
+/// A witness proof entry
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WitnessProofEntry {
+    /// Version ID the proofs apply to
+    #[serde(rename = "versionId")]
+    pub version_id: String,
+    
+    /// List of witness proofs
+    pub proof: Vec<Proof>,
+}
+
+/// DID Resolution result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DIDResolutionResult {
+    /// The resolved DID Document
+    #[serde(rename = "didDocument")]
+    pub did_document: Value,
+    
+    /// Metadata about the DID Document
+    #[serde(rename = "didDocumentMetadata")]
+    pub did_document_metadata: DIDDocumentMetadata,
+    
+    /// Metadata about the resolution process
+    #[serde(rename = "didResolutionMetadata")]
+    pub did_resolution_metadata: DIDResolutionMetadata,
+}
+
+/// Metadata about the DID Document
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DIDDocumentMetadata {
+    /// When the DID Document was created
+    pub created: Option<String>,
+    
+    /// When the DID Document was last updated
+    pub updated: Option<String>,
+    
+    /// Whether the DID is deactivated
+    pub deactivated: Option<bool>,
+    
+    /// The version ID of the DID Document
+    #[serde(rename = "versionId")]
+    pub version_id: Option<String>,
+    
+    /// The version ID of the next DID Document
+    #[serde(rename = "nextVersionId")]
+    pub next_version_id: Option<String>,
+    
+    /// Other identifiers that refer to the same subject
+    #[serde(rename = "equivalentId")]
+    pub equivalent_id: Option<Vec<String>>,
+    
+    /// The canonical ID for the DID
+    #[serde(rename = "canonicalId")]
+    pub canonical_id: Option<String>,
+}
+
+/// Metadata about the resolution process
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DIDResolutionMetadata {
+    /// The content type of the resolved DID Document
+    #[serde(rename = "contentType")]
+    pub content_type: String,
+    
+    /// Error encountered during resolution, if any
+    pub error: Option<String>,
+    
+    /// Any additional properties
+    #[serde(flatten)]
+    pub additional_properties: HashMap<String, Value>,
+}
+
+/// Options for DID resolution
+#[derive(Debug, Clone, Default)]
+pub struct ResolutionOptions {
+    /// Specific version ID to resolve
+    pub version_id: Option<String>,
+    
+    /// Specific version time to resolve
+    pub version_time: Option<String>,
+    
+    /// Specific version number to resolve
+    pub version_number: Option<u64>,
+    
+    /// Accept header to use for HTTP requests
+    pub accept: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_did_log_entry_serialization() {
+        let entry = DIDLogEntry {
+            version_id: "1-QmQq6Kg4ZZ1p49znzxnWmes4LkkWgMWLrnrfPre8UD56bz".to_string(),
+            version_time: "2024-09-26T23:22:26Z".to_string(),
+            parameters: Parameters {
+                method: Some("did:webvh:0.5".to_string()),
+                scid: Some("QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ".to_string()),
+                update_keys: Some(vec!["z6MkhbNRN2Q9BaY9TvTc2K3izkhfVwgHiXL7VWZnTqxEvc3R".to_string()]),
+                next_key_hashes: Some(vec!["QmXC3vvStVVzCBHRHGUsksGxn6BNmkdETXJGDBXwNSTL33".to_string()]),
+                portable: Some(false),
+                witness: None,
+                deactivated: Some(false),
+                ttl: None,
+            },
+            state: json!({
+                "@context": ["https://www.w3.org/ns/did/v1"],
+                "id": "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:domain.example"
+            }),
+            proof: vec![Proof {
+                type_: "DataIntegrityProof".to_string(),
+                cryptosuite: "eddsa-jcs-2022".to_string(),
+                verification_method: "did:key:z6MkhbNRN2Q9BaY9TvTc2K3izkhfVwgHiXL7VWZnTqxEvc3R#z6MkhbNRN2Q9BaY9TvTc2K3izkhfVwgHiXL7VWZnTqxEvc3R".to_string(),
+                created: "2024-09-26T23:22:26Z".to_string(),
+                proof_purpose: "assertionMethod".to_string(),
+                proof_value: "z2fPF6fMewtV15kji2N432R7RjmmFs8p7MiSHSTM9FoVmJPtc3JUuZ472pZKoWgZDuT75EDwkGmZbK8ZKVF55pXvx".to_string(),
+            }],
+        };
+
+        // Serialize to JSON
+        let json_str = serde_json::to_string(&entry).expect("Failed to serialize DIDLogEntry");
+        
+        // Deserialize back to a DIDLogEntry
+        let deserialized: DIDLogEntry = serde_json::from_str(&json_str).expect("Failed to deserialize DIDLogEntry");
+        
+        // Check that the deserialized entry matches the original
+        assert_eq!(entry.version_id, deserialized.version_id);
+        assert_eq!(entry.version_time, deserialized.version_time);
+        assert_eq!(entry.parameters.method, deserialized.parameters.method);
+        assert_eq!(entry.parameters.scid, deserialized.parameters.scid);
+        assert_eq!(entry.parameters.update_keys, deserialized.parameters.update_keys);
+        assert_eq!(entry.parameters.next_key_hashes, deserialized.parameters.next_key_hashes);
+        
+        // Just check that we have the same number of proofs
+        assert_eq!(entry.proof.len(), deserialized.proof.len());
+        
+        // More detailed checks could be added
+    }
+
+    #[test]
+    fn test_did_log_entry_deserialization_from_json_lines() {
+        // This is a typical JSON Lines format DID log entry
+        let json_str = r#"{"versionId": "1-QmQq6Kg4ZZ1p49znzxnWmes4LkkWgMWLrnrfPre8UD56bz", "versionTime": "2024-09-26T23:22:26Z", "parameters": {"prerotation": true, "updateKeys": ["z6MkhbNRN2Q9BaY9TvTc2K3izkhfVwgHiXL7VWZnTqxEvc3R"], "nextKeyHashes": ["QmXC3vvStVVzCBHRHGUsksGxn6BNmkdETXJGDBXwNSTL33"], "method": "did:webvh:0.5", "scid": "QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ"}, "state": {"@context": ["https://www.w3.org/ns/did/v1"], "id": "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:domain.example"}, "proof": [{"type": "DataIntegrityProof", "cryptosuite": "eddsa-jcs-2022", "verificationMethod": "did:key:z6MkhbNRN2Q9BaY9TvTc2K3izkhfVwgHiXL7VWZnTqxEvc3R#z6MkhbNRN2Q9BaY9TvTc2K3izkhfVwgHiXL7VWZnTqxEvc3R", "created": "2024-09-26T23:22:26Z", "proofPurpose": "assertionMethod", "proofValue": "z2fPF6fMewtV15kji2N432R7RjmmFs8p7MiSHSTM9FoVmJPtc3JUuZ472pZKoWgZDuT75EDwkGmZbK8ZKVF55pXvx"}]}"#;
+        
+        // Deserialize the JSON string into a DIDLogEntry
+        let entry: DIDLogEntry = serde_json::from_str(json_str).expect("Failed to deserialize DIDLogEntry");
+        
+        // Check some of the deserialized values
+        assert_eq!(entry.version_id, "1-QmQq6Kg4ZZ1p49znzxnWmes4LkkWgMWLrnrfPre8UD56bz");
+        assert_eq!(entry.version_time, "2024-09-26T23:22:26Z");
+        assert_eq!(entry.parameters.method, Some("did:webvh:0.5".to_string()));
+        assert_eq!(entry.parameters.scid, Some("QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ".to_string()));
+        
+        // Check that the proof was deserialized correctly
+        assert_eq!(entry.proof.len(), 1);
+        assert_eq!(entry.proof[0].type_, "DataIntegrityProof");
+        assert_eq!(entry.proof[0].cryptosuite, "eddsa-jcs-2022");
+        assert_eq!(entry.proof[0].proof_purpose, "assertionMethod");
+    }
+}
+
+================
+File: src/url/mod.rs
+================
+//! Module for handling DID URL parsing and transformations.
+//! 
+//! This module implements the DID-to-HTTPS transformations as defined in the did:webvh specification,
+//! which builds upon the did:web transformation with the addition of the SCID.
+
+use crate::error::{ResolverError, Result};
+use std::fmt;
+use url::Url;
+
+/// Type of DID URL path resolution
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DIDUrlType {
+    /// Regular DID resolution (no path)
+    DIDResolution,
+    /// Whois endpoint (/whois)
+    Whois,
+    /// Path-based resolution
+    Path(String),
+}
+
+/// A parsed did:webvh URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DIDUrl {
+    /// The full DID URL
+    pub did_url: String,
+    /// The SCID part of the DID
+    pub scid: String,
+    /// The domain part of the DID
+    pub domain: String,
+    /// Optional port number
+    pub port: Option<u16>,
+    /// Optional path segments in the DID
+    pub path_segments: Vec<String>,
+    /// Optional query parameters
+    pub query: Option<String>,
+    /// Optional fragment
+    pub fragment: Option<String>,
+    /// The type of DID URL resolution needed
+    pub url_type: DIDUrlType,
+}
+
+impl fmt::Display for DIDUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut result = format!("did:webvh:{}:{}", self.scid, self.domain);
+        
+        // Add port if present
+        if let Some(port) = self.port {
+            result.push_str(&format!("%3A{}", port));
+        }
+        
+        // Add path segments if present
+        for segment in &self.path_segments {
+            result.push_str(&format!(":{}", segment));
+        }
+        
+        // Add query if present
+        if let Some(query) = &self.query {
+            result.push_str(&format!("?{}", query));
+        }
+        
+        // Add fragment if present
+        if let Some(fragment) = &self.fragment {
+            result.push_str(&format!("#{}", fragment));
+        }
+        
+        write!(f, "{}", result)
+    }
+}
+
+impl DIDUrl {
+    /// Parse a did:webvh URL string into a DIDUrl struct.
+    pub fn parse(did_url: &str) -> Result<Self> {
+        // Basic validation first
+        if !did_url.starts_with("did:webvh:") {
+            return Err(ResolverError::DIDParsing(
+                "DID URL must start with 'did:webvh:'".to_string(),
+            ));
+        }
+        
+        // Extract method-specific identifier (everything after did:webvh:)
+        let method_specific_id = &did_url[10..];
+        
+        // Split on # to separate fragment
+        let (before_fragment, fragment) = match method_specific_id.split_once('#') {
+            Some((before, fragment)) => (before, Some(fragment.to_string())),
+            None => (method_specific_id, None),
+        };
+        
+        // Split on ? to separate query
+        let (before_query, query) = match before_fragment.split_once('?') {
+            Some((before, query)) => (before, Some(query.to_string())),
+            None => (before_fragment, None),
+        };
+        
+        // Now process the method-specific identifier
+        let segments: Vec<&str> = before_query.split(':').collect();
+        
+        if segments.len() < 2 {
+            return Err(ResolverError::DIDParsing(
+                "DID URL must contain at least SCID and domain segments".to_string(),
+            ));
+        }
+        
+        let scid = segments[0].to_string();
+        let domain_with_port = segments[1];
+        
+        // Process domain and port
+        let (domain, port) = if domain_with_port.contains("%3A") {
+            let parts: Vec<&str> = domain_with_port.split("%3A").collect();
+            if parts.len() != 2 {
+                return Err(ResolverError::DIDParsing(
+                    "Invalid port specification".to_string(),
+                ));
+            }
+            let port = match parts[1].parse::<u16>() {
+                Ok(p) => p,
+                Err(_) => {
+                    return Err(ResolverError::DIDParsing(
+                        "Invalid port number".to_string(),
+                    ))
+                }
+            };
+            (parts[0].to_string(), Some(port))
+        } else {
+            (domain_with_port.to_string(), None)
+        };
+        
+        // Process path segments (if any)
+        let path_segments = if segments.len() > 2 {
+            segments[2..].iter().map(|s| s.to_string()).collect()
+        } else {
+            Vec::new()
+        };
+        
+        // Determine URL type based on path segments and query
+        let url_type = if let Some(query_str) = &query {
+            // Handle service and relativeRef query parameters
+            if query_str.contains("service=files") && query_str.contains("relativeRef=") {
+                // Extract the relative ref from the query
+                if let Some(relative_ref) = query_str
+                    .split('&')
+                    .find(|s| s.starts_with("relativeRef="))
+                {
+                    let path = relative_ref
+                        .strip_prefix("relativeRef=")
+                        .unwrap_or("")
+                        .to_string();
+                    DIDUrlType::Path(path)
+                } else {
+                    DIDUrlType::DIDResolution
+                }
+            } else {
+                DIDUrlType::DIDResolution
+            }
+        } else if !path_segments.is_empty() && path_segments.last().unwrap() == "whois" {
+            // Check if the last path segment is "whois"
+            DIDUrlType::Whois
+        } else {
+            DIDUrlType::DIDResolution
+        };
+        
+        Ok(DIDUrl {
+            did_url: did_url.to_string(),
+            scid,
+            domain,
+            port,
+            path_segments,
+            query,
+            fragment,
+            url_type,
+        })
+    }
+    
+    /// Transform the DID URL to an HTTPS URL according to the did:webvh specification.
+    ///
+    /// # Note
+    /// This implementation does not yet handle internationalized domain names (IDNs)
+    /// according to IDNA 2008 (RFC5895). When dealing with IDNs, additional
+    /// processing will be required, including Unicode normalization and Punycode encoding.
+    /// The did:webvh spec explicitly references this requirement in section 5.1.5.
+    pub fn to_https_url(&self) -> Result<Url> {
+        // Step 1: Start building the base URL
+        let mut base_url = format!("https://{}", self.domain);
+        
+        // Step 2: Add port if present
+        if let Some(port) = self.port {
+            base_url.push_str(&format!(":{}", port));
+        }
+        
+        // Step 3: Determine path based on URL type
+        let path = match &self.url_type {
+            DIDUrlType::DIDResolution => {
+                if self.path_segments.is_empty() {
+                    // If no path segments, use /.well-known/did.jsonl
+                    "/.well-known/did.jsonl".to_string()
+                } else {
+                    // Otherwise, use /path/to/did.jsonl
+                    format!("/{}/did.jsonl", self.path_segments.join("/"))
+                }
+            }
+            DIDUrlType::Whois => {
+                if self.path_segments.is_empty() {
+                    // If no path segments, use /whois.vp
+                    "/whois.vp".to_string()
+                } else {
+                    // Remove the last "whois" segment and use that path for whois.vp
+                    let base_path = if self.path_segments.len() > 1 {
+                        self.path_segments[..self.path_segments.len() - 1].join("/")
+                    } else {
+                        // If only "whois" is present, use empty base path
+                        "".to_string()
+                    };
+                    
+                    if base_path.is_empty() {
+                        "/whois.vp".to_string()
+                    } else {
+                        format!("/{}/whois.vp", base_path)
+                    }
+                }
+            }
+            DIDUrlType::Path(ref path) => {
+                // Remove any leading slash
+                let clean_path = path.trim_start_matches('/');
+                
+                if self.path_segments.is_empty() {
+                    format!("/{}", clean_path)
+                } else {
+                    format!("/{}/{}", self.path_segments.join("/"), clean_path)
+                }
+            }
+        };
+        
+        // Combine base URL and path
+        let url_str = format!("{}{}", base_url, path);
+        
+        // Parse into a URL
+        let mut url = match Url::parse(&url_str) {
+            Ok(url) => url,
+            Err(e) => return Err(ResolverError::Url(e)),
+        };
+        
+        // Add query parameters if present and not already processed as part of the URL type
+        if let Some(query) = &self.query {
+            if !matches!(self.url_type, DIDUrlType::Path(_)) {
+                url.set_query(Some(query));
+            }
+        }
+        
+        // Add fragment if present
+        if let Some(fragment) = &self.fragment {
+            url.set_fragment(Some(fragment));
+        }
+        
+        Ok(url)
+    }
+    
+    /// Generate the URL for fetching witness proofs.
+    pub fn to_witness_url(&self) -> Result<Url> {
+        // First, get the base URL for DID resolution
+        let did_url = self.to_https_url()?;
+        
+        // Replace did.jsonl with did-witness.json
+        let witness_url_str = did_url
+            .as_str()
+            .replace("did.jsonl", "did-witness.json");
+        
+        // Parse into a URL
+        match Url::parse(&witness_url_str) {
+            Ok(url) => Ok(url),
+            Err(e) => Err(ResolverError::Url(e)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_basic_did_url() {
+        let did_url = "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:example.com";
+        let parsed = DIDUrl::parse(did_url).unwrap();
+        
+        assert_eq!(parsed.scid, "QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ");
+        assert_eq!(parsed.domain, "example.com");
+        assert_eq!(parsed.port, None);
+        assert!(parsed.path_segments.is_empty());
+        assert_eq!(parsed.query, None);
+        assert_eq!(parsed.fragment, None);
+        assert_eq!(parsed.url_type, DIDUrlType::DIDResolution);
+    }
+
+    #[test]
+    fn test_parse_did_url_with_port() {
+        let did_url = "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:example.com%3A3000";
+        let parsed = DIDUrl::parse(did_url).unwrap();
+        
+        assert_eq!(parsed.scid, "QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ");
+        assert_eq!(parsed.domain, "example.com");
+        assert_eq!(parsed.port, Some(3000));
+        assert!(parsed.path_segments.is_empty());
+        assert_eq!(parsed.query, None);
+        assert_eq!(parsed.fragment, None);
+        assert_eq!(parsed.url_type, DIDUrlType::DIDResolution);
+    }
+
+    #[test]
+    fn test_parse_did_url_with_path() {
+        let did_url = "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:example.com:dids:issuer";
+        let parsed = DIDUrl::parse(did_url).unwrap();
+        
+        assert_eq!(parsed.scid, "QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ");
+        assert_eq!(parsed.domain, "example.com");
+        assert_eq!(parsed.port, None);
+        assert_eq!(parsed.path_segments, vec!["dids", "issuer"]);
+        assert_eq!(parsed.query, None);
+        assert_eq!(parsed.fragment, None);
+        assert_eq!(parsed.url_type, DIDUrlType::DIDResolution);
+    }
+
+    #[test]
+    fn test_parse_did_url_with_whois() {
+        let did_url = "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:example.com:whois";
+        let parsed = DIDUrl::parse(did_url).unwrap();
+        
+        assert_eq!(parsed.scid, "QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ");
+        assert_eq!(parsed.domain, "example.com");
+        assert_eq!(parsed.port, None);
+        assert_eq!(parsed.path_segments, vec!["whois"]);
+        assert_eq!(parsed.query, None);
+        assert_eq!(parsed.fragment, None);
+        assert_eq!(parsed.url_type, DIDUrlType::Whois);
+    }
+
+    #[test]
+    fn test_parse_did_url_with_fragment() {
+        let did_url = "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:example.com#key-1";
+        let parsed = DIDUrl::parse(did_url).unwrap();
+        
+        assert_eq!(parsed.scid, "QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ");
+        assert_eq!(parsed.domain, "example.com");
+        assert_eq!(parsed.port, None);
+        assert!(parsed.path_segments.is_empty());
+        assert_eq!(parsed.query, None);
+        assert_eq!(parsed.fragment, Some("key-1".to_string()));
+        assert_eq!(parsed.url_type, DIDUrlType::DIDResolution);
+    }
+
+    #[test]
+    fn test_parse_did_url_with_query() {
+        let did_url = "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:example.com?versionId=1-abc123";
+        let parsed = DIDUrl::parse(did_url).unwrap();
+        
+        assert_eq!(parsed.scid, "QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ");
+        assert_eq!(parsed.domain, "example.com");
+        assert_eq!(parsed.port, None);
+        assert!(parsed.path_segments.is_empty());
+        assert_eq!(parsed.query, Some("versionId=1-abc123".to_string()));
+        assert_eq!(parsed.fragment, None);
+        assert_eq!(parsed.url_type, DIDUrlType::DIDResolution);
+    }
+
+    #[test]
+    fn test_parse_did_url_with_relative_ref() {
+        let did_url = "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:example.com?service=files&relativeRef=/path/to/resource";
+        let parsed = DIDUrl::parse(did_url).unwrap();
+        
+        assert_eq!(parsed.scid, "QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ");
+        assert_eq!(parsed.domain, "example.com");
+        assert_eq!(parsed.port, None);
+        assert!(parsed.path_segments.is_empty());
+        assert_eq!(parsed.query, Some("service=files&relativeRef=/path/to/resource".to_string()));
+        assert_eq!(parsed.fragment, None);
+        
+        // Check that the URL type is correctly identified as Path
+        if let DIDUrlType::Path(path) = &parsed.url_type {
+            assert_eq!(path, "/path/to/resource");
+        } else {
+            panic!("Expected DIDUrlType::Path but got {:?}", parsed.url_type);
+        }
+    }
+
+    #[test]
+    fn test_basic_https_url_transformation() {
+        let did_url = "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:example.com";
+        let parsed = DIDUrl::parse(did_url).unwrap();
+        let https_url = parsed.to_https_url().unwrap();
+        
+        assert_eq!(https_url.as_str(), "https://example.com/.well-known/did.jsonl");
+    }
+
+    #[test]
+    fn test_https_url_transformation_with_port() {
+        let did_url = "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:example.com%3A3000";
+        let parsed = DIDUrl::parse(did_url).unwrap();
+        let https_url = parsed.to_https_url().unwrap();
+        
+        assert_eq!(https_url.as_str(), "https://example.com:3000/.well-known/did.jsonl");
+    }
+
+    #[test]
+    fn test_https_url_transformation_with_path() {
+        let did_url = "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:example.com:dids:issuer";
+        let parsed = DIDUrl::parse(did_url).unwrap();
+        let https_url = parsed.to_https_url().unwrap();
+        
+        assert_eq!(https_url.as_str(), "https://example.com/dids/issuer/did.jsonl");
+    }
+
+    #[test]
+    fn test_https_url_transformation_with_whois() {
+        let did_url = "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:example.com:whois";
+        let parsed = DIDUrl::parse(did_url).unwrap();
+        let https_url = parsed.to_https_url().unwrap();
+        
+        assert_eq!(https_url.as_str(), "https://example.com/whois.vp");
+    }
+
+    #[test]
+    fn test_https_url_transformation_with_query() {
+        let did_url = "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:example.com?versionId=1-abc123";
+        let parsed = DIDUrl::parse(did_url).unwrap();
+        let https_url = parsed.to_https_url().unwrap();
+        
+        assert_eq!(https_url.as_str(), "https://example.com/.well-known/did.jsonl?versionId=1-abc123");
+    }
+
+    #[test]
+    fn test_witness_url_transformation() {
+        let did_url = "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:example.com";
+        let parsed = DIDUrl::parse(did_url).unwrap();
+        let witness_url = parsed.to_witness_url().unwrap();
+        
+        assert_eq!(witness_url.as_str(), "https://example.com/.well-known/did-witness.json");
+    }
+
+    #[test]
+    fn test_parse_did_url_with_multiple_path_segments_including_whois() {
+        let did_url = "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:example.com:path1:path2:whois";
+        let parsed = DIDUrl::parse(did_url).unwrap();
+        
+        assert_eq!(parsed.scid, "QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ");
+        assert_eq!(parsed.domain, "example.com");
+        assert_eq!(parsed.port, None);
+        assert_eq!(parsed.path_segments, vec!["path1", "path2", "whois"]);
+        assert_eq!(parsed.query, None);
+        assert_eq!(parsed.fragment, None);
+        
+        // The last segment is "whois", so it should be identified as Whois
+        assert_eq!(parsed.url_type, DIDUrlType::Whois);
+        
+        // Verify URL transformation
+        let https_url = parsed.to_https_url().unwrap();
+        assert_eq!(https_url.as_str(), "https://example.com/path1/path2/whois.vp");
+    }
+
+    #[test]
+    fn test_parse_did_url_with_whois_not_as_last_segment() {
+        let did_url = "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:example.com:whois:path1";
+        let parsed = DIDUrl::parse(did_url).unwrap();
+        
+        assert_eq!(parsed.scid, "QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ");
+        assert_eq!(parsed.domain, "example.com");
+        assert_eq!(parsed.port, None);
+        assert_eq!(parsed.path_segments, vec!["whois", "path1"]);
+        assert_eq!(parsed.query, None);
+        assert_eq!(parsed.fragment, None);
+        
+        // When "whois" is not the last segment, it should be treated as a regular path segment
+        assert_eq!(parsed.url_type, DIDUrlType::DIDResolution);
+        
+        // Verify URL transformation (should be treated as a regular DID resolution)
+        let https_url = parsed.to_https_url().unwrap();
+        assert_eq!(https_url.as_str(), "https://example.com/whois/path1/did.jsonl");
+    }
+
+    #[test]
+    fn test_parse_did_url_with_query_parameters_and_path_resolution() {
+        let did_url = "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:example.com:path1:path2?service=files&relativeRef=resource.json";
+        let parsed = DIDUrl::parse(did_url).unwrap();
+        
+        assert_eq!(parsed.scid, "QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ");
+        assert_eq!(parsed.domain, "example.com");
+        assert_eq!(parsed.port, None);
+        assert_eq!(parsed.path_segments, vec!["path1", "path2"]);
+        assert_eq!(parsed.query, Some("service=files&relativeRef=resource.json".to_string()));
+        assert_eq!(parsed.fragment, None);
+        
+        // Check URL type is correctly identified as Path
+        if let DIDUrlType::Path(path) = &parsed.url_type {
+            assert_eq!(path, "resource.json");
+        } else {
+            panic!("Expected DIDUrlType::Path but got {:?}", parsed.url_type);
+        }
+        
+        // Verify URL transformation for path-based resolution
+        let https_url = parsed.to_https_url().unwrap();
+        assert_eq!(https_url.as_str(), "https://example.com/path1/path2/resource.json");
+    }
+
+    #[test]
+    fn test_parse_did_url_with_query_parameters_and_fragment() {
+        let did_url = "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:example.com?versionId=1-abc123#key-1";
+        let parsed = DIDUrl::parse(did_url).unwrap();
+        
+        assert_eq!(parsed.scid, "QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ");
+        assert_eq!(parsed.domain, "example.com");
+        assert_eq!(parsed.port, None);
+        assert!(parsed.path_segments.is_empty());
+        assert_eq!(parsed.query, Some("versionId=1-abc123".to_string()));
+        assert_eq!(parsed.fragment, Some("key-1".to_string()));
+        
+        // Verify URL transformation with both query parameters and fragment
+        let https_url = parsed.to_https_url().unwrap();
+        assert_eq!(https_url.as_str(), "https://example.com/.well-known/did.jsonl?versionId=1-abc123#key-1");
+    }
+
+    #[test]
+    fn test_parse_path_resolution_with_encoded_characters() {
+        let did_url = "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:example.com?service=files&relativeRef=path%20with%20spaces.json";
+        let parsed = DIDUrl::parse(did_url).unwrap();
+        
+        // Check URL type is correctly identified as Path with encoded characters
+        if let DIDUrlType::Path(path) = &parsed.url_type {
+            assert_eq!(path, "path%20with%20spaces.json");
+        } else {
+            panic!("Expected DIDUrlType::Path but got {:?}", parsed.url_type);
+        }
+        
+        // Verify URL transformation preserves encoded characters
+        let https_url = parsed.to_https_url().unwrap();
+        assert_eq!(https_url.as_str(), "https://example.com/path%20with%20spaces.json");
+    }
+
+    #[test]
+    fn test_parse_did_url_with_complex_path_and_witness_url() {
+        let did_url = "did:webvh:QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ:example.com:org:dept:users";
+        let parsed = DIDUrl::parse(did_url).unwrap();
+        
+        assert_eq!(parsed.scid, "QmfGEUAcMpzo25kF2Rhn8L5FAXysfGnkzjwdKoNPi615XQ");
+        assert_eq!(parsed.path_segments, vec!["org", "dept", "users"]);
+        
+        // Verify DID resolution URL
+        let https_url = parsed.to_https_url().unwrap();
+        assert_eq!(https_url.as_str(), "https://example.com/org/dept/users/did.jsonl");
+        
+        // Verify witness URL transformation
+        let witness_url = parsed.to_witness_url().unwrap();
+        assert_eq!(witness_url.as_str(), "https://example.com/org/dept/users/did-witness.json");
+    }
+}
+
+================
+File: src/utils/mod.rs
+================
+//! Utility functions for the didwebvh-resolver
+
+================
+File: src/error.rs
+================
+//! Error types for the didwebvh-resolver crate.
+
+use thiserror::Error;
+
+/// Main error type for the didwebvh-resolver crate.
+#[derive(Error, Debug)]
+pub enum ResolverError {
+    /// Errors related to DID parsing and validation
+    #[error("DID parsing error: {0}")]
+    DIDParsing(String),
+
+    /// Errors related to DID resolution
+    #[error("DID resolution error: {0}")]
+    Resolution(String),
+    
+    /// Errors related to DID log parsing and validation
+    #[error("DID log error: {0}")]
+    LogProcessing(String),
+    
+    /// Errors related to verification of DID log entries
+    #[error("Verification error: {0}")]
+    Verification(String),
+    
+    /// Errors related to HTTP operations
+    #[error("HTTP error: {0}")]
+    Http(String),
+    
+    /// Errors related to JSON processing
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+    
+    /// Errors related to URL parsing and manipulation
+    #[error("URL error: {0}")]
+    Url(#[from] url::ParseError),
+    
+    /// Errors related to timestamp parsing and processing
+    #[error("Time error: {0}")]
+    Time(String),
+    
+    /// Other general errors
+    #[error("General error: {0}")]
+    General(String),
+}
+
+/// Error type for the DID resolution process as defined in the DID Core specification.
+/// These are errors that must be communicated in the resolution metadata.
+#[derive(Error, Debug)]
+pub enum ResolutionError {
+    /// DID not found
+    #[error("DID not found")]
+    NotFound,
+    
+    /// DID is invalid
+    #[error("Invalid DID: {0}")]
+    InvalidDID(String),
+    
+    /// DID method not supported
+    #[error("Method not supported")]
+    MethodNotSupported,
+    
+    /// DID resolution failed due to an internal error
+    #[error("Internal error: {0}")]
+    InternalError(String),
+    
+    /// DID document is invalid
+    #[error("Invalid DID document: {0}")]
+    InvalidDIDDocument(String),
+    
+    /// DID log verification failed
+    #[error("Verification failed: {0}")]
+    VerificationFailed(String),
+}
+
+/// Result type for resolver operations
+pub type Result<T> = std::result::Result<T, ResolverError>;
+
+/// Result type for resolution operations
+pub type ResolutionResult<T> = std::result::Result<T, ResolutionError>;
+
+================
+File: src/lib.rs
+================
+//! A Rust implementation of the did:webvh resolver.
+//!
+//! This crate provides functionality to resolve did:webvh DIDs
+//! according to the did:webvh specification.
+
+// Re-export main types
+pub mod error;
+pub mod types;
+pub mod url;
+pub mod utils;
+pub mod http;
+pub mod log;
+pub mod resolver;
+pub mod crypto;
+
+pub use error::{ResolverError, ResolutionError, Result, ResolutionResult};
+pub use url::DIDUrl;
+pub use http::{HttpClient, DefaultHttpClient};
+pub use resolver::WebVHResolver;
+pub use types::{
+    DIDResolutionResult, DIDDocumentMetadata, DIDResolutionMetadata,
+    ResolutionOptions, DIDLogEntry, Parameters, Proof, WitnessConfig, Witness,
+};
+
+================
+File: .gitignore
+================
+/target
+
+================
+File: Cargo.toml
+================
+[package]
+name = "didwebvh-resolver"
+version = "0.1.0"
+edition = "2021"
+description = "A Rust implementation of the did:webvh DID method resolver"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/your-username/didwebvh-rs"
+readme = "README.md"
+keywords = ["did", "webvh", "resolver", "verifiable", "credentials"]
+categories = ["cryptography", "authentication"]
+
+[dependencies]
+# Core functionality
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0.12"
+url = "2.4"
+async-trait = "0.1"
+percent-encoding = "2.1"
+# HTTP client
+reqwest = { version = "0.12.14", features = ["json"] }
+
+# Cryptographic dependencies
+sha2 = "0.10"
+base58 = "0.2"
+multihash = "0.19.3"
+ed25519-dalek = "2.0"
+serde_json_canonicalizer = "0.3.0"  # For JCS (JSON Canonicalization Scheme)
+# Async runtime
+tokio = { version = "1.30", features = ["rt", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "1.30", features = ["rt", "macros", "rt-multi-thread"] }
+mockall = "0.13.1"
+wiremock = "0.6.3"
+
+
+
+================================================================
+End of Codebase
+================================================================
